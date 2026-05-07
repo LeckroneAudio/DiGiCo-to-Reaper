@@ -1,3 +1,11 @@
+# macOS
+.DS_Store
+
+# Local build artifacts
+backups/
+*.dmg
+*.zip
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
