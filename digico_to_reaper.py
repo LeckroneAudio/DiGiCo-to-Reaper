@@ -8,10 +8,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import os
 import re
+import struct
 import subprocess
 import uuid
 import socket
 import threading
+import zlib
 from urllib.parse import parse_qs
 
 try:
@@ -115,7 +117,131 @@ def parse_digico_rtf(rtf_content):
     print(f"Aux: {len(result['aux'])}")
     print(f"Groups: {len(result['groups'])}")
     print(f"Matrix: {len(result['matrix'])}")
-    
+
+    return result
+
+
+def parse_rivage_pm_show_file(file_content):
+    """Parse a Yamaha Rivage PM .RIVAGEPM show file and extract channel sections.
+
+    The file is a Yamaha MBDF (Multi-Block Data Format) container.  The mixing
+    data lives in the first zlib-compressed block that contains the b'EN00/mix'
+    marker.  Inside that block a binary schema section (COL0 / PR entries)
+    precedes a raw data section whose layout is described by the schema.
+    """
+
+    if isinstance(file_content, str):
+        file_content = file_content.encode('latin-1')
+
+    # ── 1. Locate and decompress the mixing block ──────────────────────────
+    raw = None
+    for pos in range(0, len(file_content) - 2):
+        if file_content[pos:pos+2] not in (b'\x78\x01', b'\x78\x9c', b'\x78\xda'):
+            continue
+        try:
+            candidate = zlib.decompress(file_content[pos:pos+200000])
+            if b'EN00/mix' in candidate[:256]:
+                raw = candidate
+                break
+        except Exception:
+            continue
+
+    if raw is None:
+        return {'inputs': [], 'aux': [], 'groups': [], 'matrix': []}
+
+    # ── 2. Walk COL0/PR schema entries to find data-section start ──────────
+    schema = []
+    pos = 196  # skip file/block headers
+    while pos < len(raw) - 32:
+        if raw[pos:pos+4] == b'COL0':
+            name_b = raw[pos+4:pos+28]
+            name = name_b[:name_b.find(0) if 0 in name_b else 24].decode('ascii', errors='replace')
+            vals = struct.unpack('<5I', raw[pos+28:pos+48])
+            schema.append({'kind': 'COL0', 'name': name, 'v': vals})
+            pos += 48
+        elif raw[pos:pos+3] == b'PR ':
+            pos += 32
+        else:
+            break
+
+    data_start = pos
+
+    # ── 3. Build a map of top-level channel sections ───────────────────────
+    # For each section (InputChannel, Mix, …) we need:
+    #   data_offset  – byte offset from data_start to this section's records
+    #   rec_size     – bytes per record
+    #   count        – number of records
+    #   name_offset  – byte offset of the Name field within each record
+    #                  (equals v[2] of the immediately-following COL0Label)
+    TARGET_SECTIONS = ('InputChannel', 'Mix', 'Matrix', 'Stereo')
+    sections = {}
+    for i, entry in enumerate(schema):
+        if entry['kind'] != 'COL0' or entry['name'] not in TARGET_SECTIONS:
+            continue
+        v = entry['v']
+        if v[4] < 1:
+            continue
+        # Look ahead for the next COL0Label to get the name field offset
+        name_offset = None
+        for j in range(i + 1, min(i + 60, len(schema))):
+            if schema[j]['kind'] == 'COL0' and schema[j]['name'] == 'Label':
+                name_offset = schema[j]['v'][2]
+                break
+        if name_offset is None:
+            continue
+        if entry['name'] not in sections:  # keep first occurrence only
+            sections[entry['name']] = {
+                'data_offset': v[2],
+                'rec_size':    v[3],
+                'count':       v[4],
+                'name_offset': name_offset,
+            }
+
+    # ── 4. Extract channel names ───────────────────────────────────────────
+    def read_names(sect_name):
+        info = sections.get(sect_name)
+        if not info:
+            return []
+        sect_start = data_start + info['data_offset']
+        names = []
+        seen = set()
+        for i in range(info['count']):
+            p = sect_start + i * info['rec_size'] + info['name_offset']
+            nb = raw[p:p+64]
+            null = nb.find(0)
+            name = nb[:null if null >= 0 else 64].decode('ascii', errors='replace').strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        return names
+
+    input_names  = read_names('InputChannel')
+    mix_names    = read_names('Mix')
+    matrix_names = read_names('Matrix')
+    stereo_names = read_names('Stereo')
+
+    # ── 5. Build the standard result structure ─────────────────────────────
+    result = {'inputs': [], 'aux': [], 'groups': [], 'matrix': []}
+
+    for i, name in enumerate(input_names):
+        result['inputs'].append({'number': str(i + 1), 'name': name, 'type': 'inputs'})
+
+    for i, name in enumerate(mix_names):
+        result['aux'].append({'number': f'MX{i+1}', 'name': name, 'type': 'aux'})
+
+    for i, name in enumerate(stereo_names):
+        result['groups'].append({'number': f'ST{i+1}', 'name': name, 'type': 'groups'})
+
+    for i, name in enumerate(matrix_names):
+        result['matrix'].append({'number': f'MT{i+1}', 'name': name, 'type': 'matrix'})
+
+    print(f"\n=== RIVAGE PARSE SUMMARY ===")
+    print(f"Inputs: {len(result['inputs'])}")
+    print(f"Mix (Aux): {len(result['aux'])}")
+    print(f"Stereo (Groups): {len(result['groups'])}")
+    print(f"Matrix: {len(result['matrix'])}")
+
     return result
 
 
@@ -859,16 +985,16 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
         
         <div class="tab-bar" id="tabBar"></div>
 
-        <h1>DiGiCo to Reaper Converter</h1>
-        <p class="subtitle">Convert DiGiCo session reports to Reaper track templates</p>
-        
+        <h1>Console to Reaper Converter</h1>
+        <p class="subtitle">Convert DiGiCo or Yamaha Rivage show files to Reaper track templates</p>
+
         <div id="uploadArea" class="upload-area" onclick="document.getElementById('fileInput').click()">
             <div class="upload-icon">📄</div>
-            <div class="upload-text">Drop DiGiCo session report here</div>
-            <div class="upload-subtext">or click to browse (.rtf files)</div>
+            <div class="upload-text">Drop your show file here</div>
+            <div class="upload-subtext">or click to browse &nbsp;·&nbsp; DiGiCo (.rtf) &nbsp;·&nbsp; Yamaha Rivage (.RIVAGEPM)</div>
         </div>
-        
-        <input type="file" id="fileInput" accept=".rtf" onchange="handleFile(this.files[0])">
+
+        <input type="file" id="fileInput" accept=".rtf,.RIVAGEPM,.rivagepm" onchange="handleFile(this.files[0])">
         
         <div id="message" class="message"></div>
         
@@ -977,12 +1103,13 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
         <div class="info-box">
             <h3>How to use:</h3>
             <ol>
-                <li>Export session report from DiGiCo console (.rtf file)</li>
-                <li>Upload the file here</li>
+                <li><strong>DiGiCo:</strong> Export session report from the console (.rtf file)</li>
+                <li><strong>Yamaha Rivage PM:</strong> Copy the .RIVAGEPM show file from the console or Rivage PM Editor</li>
+                <li>Upload or drag the file here</li>
                 <li>Select/deselect channels you want to import</li>
                 <li>Download the .RTrackTemplate file</li>
                 <li>Open blank Reaper session</li>
-                <li>Track → Insert tracks from template → Select the downloaded file (or just drag the file into the session)</li>
+                <li>Track → Insert tracks from template → Select the downloaded file (or drag it in)</li>
             </ol>
         </div>
     </div>
@@ -1290,10 +1417,11 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
             e.preventDefault();
             uploadArea.classList.remove('dragover');
             const file = e.dataTransfer.files[0];
-            if (file && file.name.endsWith('.rtf')) {
+            const name = file ? file.name.toLowerCase() : '';
+            if (file && (name.endsWith('.rtf') || name.endsWith('.rivagepm'))) {
                 handleFile(file);
             } else {
-                showMessage('Please upload an .rtf file', 'error');
+                showMessage('Please upload a .rtf (DiGiCo) or .RIVAGEPM (Yamaha Rivage) file', 'error');
             }
         });
         
@@ -1329,9 +1457,13 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
                     
                     // Update preview with selected sections
                     updateSectionPreview();
-                    
+
                     const total = data.counts.inputs + data.counts.aux + data.counts.groups + data.counts.matrix;
-                    showMessage(`✓ Successfully parsed ${total} total channels (${data.counts.inputs} inputs, ${data.counts.aux} aux, ${data.counts.groups} groups, ${data.counts.matrix} matrix)`, 'success');
+                    if (total === 0) {
+                        showMessage('✗ "' + file.name + '" — No Channels Found, Please ensure Include: Channels is selected when saving the Session Report.', 'error');
+                    } else {
+                        showMessage(`✓ "${file.name}" — ${total} total channels (${data.counts.inputs} inputs, ${data.counts.aux} aux, ${data.counts.groups} groups, ${data.counts.matrix} matrix)`, 'success');
+                    }
                 } else {
                     showMessage('✗ Error: ' + data.error, 'error');
                 }
@@ -2082,6 +2214,7 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
             const msgDiv = document.getElementById('message');
             msgDiv.textContent = msg;
             msgDiv.className = 'message ' + type;
+            msgDiv.style.display = '';
         }
         
         // Heartbeat check to detect server disconnect
@@ -2128,31 +2261,33 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
             # Parse multipart form data
             content_length = int(self.headers['Content-Length'])
             body = self.rfile.read(content_length)
-            
+
             # Simple multipart parsing (for single file upload)
             boundary = self.headers['Content-Type'].split('boundary=')[1]
             parts = body.split(('--' + boundary).encode())
-            
+
             file_content = None
+            filename = ''
             for part in parts:
-                if b'filename=' in part and b'.rtf' in part:
+                if b'filename=' in part:
+                    # Extract filename
+                    fn_match = re.search(rb'filename="([^"]+)"', part)
+                    if fn_match:
+                        filename = fn_match.group(1).decode('utf-8', errors='replace').lower()
                     file_start = part.find(b'\r\n\r\n') + 4
                     file_end = part.rfind(b'\r\n')
                     file_content = part[file_start:file_end]
                     break
-            
+
             if not file_content:
                 self.send_json({'success': False, 'error': 'No file found in upload'})
                 return
-            
-            # Parse DiGiCo RTF - returns dict with all sections
-            parsed_data = parse_digico_rtf(file_content)
-            
-            # Check if we got any channels
-            total_channels = sum(len(parsed_data[section]) for section in parsed_data)
-            if total_channels == 0:
-                self.send_json({'success': False, 'error': 'Could not parse any channels from file'})
-                return
+
+            # Dispatch to the correct parser based on file extension
+            if filename.endswith('.rivagepm'):
+                parsed_data = parse_rivage_pm_show_file(file_content)
+            else:
+                parsed_data = parse_digico_rtf(file_content)
             
             self.send_json({
                 'success': True,
