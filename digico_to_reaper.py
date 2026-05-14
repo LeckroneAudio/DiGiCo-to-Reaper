@@ -5,11 +5,13 @@ Parses DiGiCo session reports and generates Reaper track templates
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import io
 import json
 import os
 import re
 import struct
 import subprocess
+import tarfile
 import uuid
 import socket
 import threading
@@ -240,6 +242,138 @@ def parse_rivage_pm_show_file(file_content):
     print(f"Inputs: {len(result['inputs'])}")
     print(f"Mix (Aux): {len(result['aux'])}")
     print(f"Stereo (Groups): {len(result['groups'])}")
+    print(f"Matrix: {len(result['matrix'])}")
+
+    return result
+
+
+def parse_dlive_show_file(file_content):
+    """Parse an Allen & Heath dLive .tar.gz show file and extract channel sections.
+
+    The show file is a tar.gz archive containing a Show/ directory.
+    Channel names live in Show/Scenes/StageBoxScene65535.tar.gz, which itself
+    contains a .dat binary file with "Name Colour Manager" sections.
+    Each channel record is 9 bytes: 1 byte color index + 8 bytes null-padded name.
+    """
+
+    if isinstance(file_content, str):
+        file_content = file_content.encode('latin-1')
+
+    # ── 1. Open outer .tar.gz and extract StageBoxScene65535.tar.gz ───────
+    try:
+        outer = tarfile.open(fileobj=io.BytesIO(file_content), mode='r:gz')
+    except Exception:
+        return {'inputs': [], 'aux': [], 'groups': [], 'matrix': []}
+
+    scene_gz = None
+    for member in outer.getmembers():
+        if 'StageBoxScene65535' in member.name and member.name.endswith('.tar.gz'):
+            f = outer.extractfile(member)
+            if f:
+                scene_gz = f.read()
+            break
+    outer.close()
+
+    if scene_gz is None:
+        return {'inputs': [], 'aux': [], 'groups': [], 'matrix': []}
+
+    # ── 2. Open inner .tar.gz and extract the .dat file ───────────────────
+    try:
+        inner = tarfile.open(fileobj=io.BytesIO(scene_gz), mode='r:gz')
+    except Exception:
+        return {'inputs': [], 'aux': [], 'groups': [], 'matrix': []}
+
+    dat = None
+    for member in inner.getmembers():
+        if member.name.endswith('.dat'):
+            f = inner.extractfile(member)
+            if f:
+                dat = f.read()
+            break
+    inner.close()
+
+    if dat is None:
+        return {'inputs': [], 'aux': [], 'groups': [], 'matrix': []}
+
+    # ── 3. Find all Name Colour Manager sections and parse records ─────────
+    # ALL_SECTIONS is used purely for boundary detection — every section header
+    # in the file must be listed so gaps between wanted sections are accurate.
+    # SECTION_MAP controls which sections we actually extract.
+    ALL_SECTIONS = [
+        b'#Input Channel Name Colour Manager',
+        b'Mono Group Channel Name Colour Manager',
+        b'Stereo Group Channel Name Colour Manager',
+        b'Mono Aux Channel Name Colour Manager',
+        b'Stereo Aux Channel Name Colour Manager',
+        b'Mono FX Send Channel Name Colour Manager',
+        b'Stereo FX Send Channel Name Colour Manager',
+        b'Stereo AHFX Send Channel Name Colour Manager',
+        b'Main Channel Name Colour Manager',
+        b'Mono Matrix Channel Name Colour Manager',
+        b'Stereo Matrix Channel Name Colour Manager',
+        b'FX Return Channel Name Colour Manager',
+        b'AHFX Return Channel Name Colour Manager',
+        b'DCA Channel Name Colour Manager',
+        b'Monitor Channel Name Colour Manager',
+    ]
+    SECTION_MAP = {
+        b'#Input Channel Name Colour Manager':        'inputs',
+        b'Mono Group Channel Name Colour Manager':    'groups',
+        b'Stereo Group Channel Name Colour Manager':  'groups',
+        b'Mono Aux Channel Name Colour Manager':      'aux',
+        b'Stereo Aux Channel Name Colour Manager':    'aux',
+        b'Main Channel Name Colour Manager':          'groups',
+        b'Mono Matrix Channel Name Colour Manager':   'matrix',
+        b'Stereo Matrix Channel Name Colour Manager': 'matrix',
+        b'Monitor Channel Name Colour Manager':       'aux',
+        b'DCA Channel Name Colour Manager':           'groups',
+    }
+
+    # Build sorted list of (name_pos, data_start, section_name) for every section found
+    all_found = []
+    for section_name in ALL_SECTIONS:
+        pos = dat.find(section_name + b'\x00')
+        if pos >= 0:
+            data_start = pos + len(section_name) + 1
+            all_found.append((pos, data_start, section_name))
+    all_found.sort()
+
+    result = {'inputs': [], 'aux': [], 'groups': [], 'matrix': []}
+    counters = {'inputs': 0, 'aux': 0, 'groups': 0, 'matrix': 0}
+    prefix_map = {'inputs': '', 'aux': 'AUX', 'groups': 'GRP', 'matrix': 'MTX'}
+
+    for idx, (pos, data_start, section_name) in enumerate(all_found):
+        category = SECTION_MAP.get(section_name)
+        if category is None:
+            continue  # boundary only — don't extract
+
+        # Use the very next section (wanted or not) as the boundary
+        next_pos = all_found[idx + 1][0] if idx + 1 < len(all_found) else data_start + 9 * 256
+        count = min((next_pos - data_start) // 9, 256)
+
+        for i in range(count):
+            rec = dat[data_start + i * 9: data_start + i * 9 + 9]
+            if len(rec) < 9:
+                break
+            name_bytes = rec[1:9]
+            null = name_bytes.find(0)
+            raw_name = name_bytes[:null if null >= 0 else 8]
+            try:
+                name = raw_name.decode('ascii').strip()
+            except UnicodeDecodeError:
+                break  # non-ASCII = past end of section
+            if not name or not name.isprintable():
+                break  # padding or control bytes = past end of section
+
+            counters[category] += 1
+            n = counters[category]
+            number = str(n) if category == 'inputs' else f'{prefix_map[category]}{n}'
+            result[category].append({'number': number, 'name': name, 'type': category})
+
+    print(f"\n=== DLIVE PARSE SUMMARY ===")
+    print(f"Inputs: {len(result['inputs'])}")
+    print(f"Aux: {len(result['aux'])}")
+    print(f"Groups: {len(result['groups'])}")
     print(f"Matrix: {len(result['matrix'])}")
 
     return result
@@ -994,7 +1128,7 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
             <div class="upload-subtext">or click to browse &nbsp;·&nbsp; DiGiCo (.rtf) &nbsp;·&nbsp; Yamaha Rivage (.RIVAGEPM)</div>
         </div>
 
-        <input type="file" id="fileInput" accept=".rtf,.RIVAGEPM,.rivagepm" onchange="handleFile(this.files[0])">
+        <input type="file" id="fileInput" accept=".rtf,.RIVAGEPM,.rivagepm,.tar.gz" onchange="handleFile(this.files[0])">
         
         <div id="message" class="message"></div>
         
@@ -1105,6 +1239,7 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
             <ol>
                 <li><strong>DiGiCo:</strong> Export session report from the console (.rtf file)</li>
                 <li><strong>Yamaha Rivage PM:</strong> Copy the .RIVAGEPM show file from the console or Rivage PM Editor</li>
+                <li><strong>Allen &amp; Heath dLive:</strong> Export the show file from dLive Director (.tar.gz)</li>
                 <li>Upload or drag the file here</li>
                 <li>Select/deselect channels you want to import</li>
                 <li>Download the .RTrackTemplate file</li>
@@ -1418,7 +1553,7 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
             uploadArea.classList.remove('dragover');
             const file = e.dataTransfer.files[0];
             const name = file ? file.name.toLowerCase() : '';
-            if (file && (name.endsWith('.rtf') || name.endsWith('.rivagepm'))) {
+            if (file && (name.endsWith('.rtf') || name.endsWith('.rivagepm') || name.endsWith('.tar.gz'))) {
                 handleFile(file);
             } else {
                 showMessage('Please upload a .rtf (DiGiCo) or .RIVAGEPM (Yamaha Rivage) file', 'error');
@@ -2286,6 +2421,8 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
             # Dispatch to the correct parser based on file extension
             if filename.endswith('.rivagepm'):
                 parsed_data = parse_rivage_pm_show_file(file_content)
+            elif filename.endswith('.tar.gz'):
+                parsed_data = parse_dlive_show_file(file_content)
             else:
                 parsed_data = parse_digico_rtf(file_content)
             
