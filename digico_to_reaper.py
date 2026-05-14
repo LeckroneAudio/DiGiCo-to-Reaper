@@ -338,6 +338,20 @@ def parse_dlive_show_file(file_content):
             all_found.append((pos, data_start, section_name))
     all_found.sort()
 
+    # Label used when a channel has only a numeric default name (e.g. "1", "32")
+    DEFAULT_LABEL = {
+        b'#Input Channel Name Colour Manager':        'Input',
+        b'Mono Group Channel Name Colour Manager':    'Mono Grp',
+        b'Stereo Group Channel Name Colour Manager':  'Stereo Grp',
+        b'Mono Aux Channel Name Colour Manager':      'Mono Aux',
+        b'Stereo Aux Channel Name Colour Manager':    'Stereo Aux',
+        b'Main Channel Name Colour Manager':          'Main',
+        b'Mono Matrix Channel Name Colour Manager':   'Mono Mtx',
+        b'Stereo Matrix Channel Name Colour Manager': 'Stereo Mtx',
+        b'Monitor Channel Name Colour Manager':       'Monitor',
+        b'DCA Channel Name Colour Manager':           'DCA',
+    }
+
     result = {'inputs': [], 'aux': [], 'groups': [], 'matrix': []}
     counters = {'inputs': 0, 'aux': 0, 'groups': 0, 'matrix': 0}
     prefix_map = {'inputs': '', 'aux': 'AUX', 'groups': 'GRP', 'matrix': 'MTX'}
@@ -350,6 +364,8 @@ def parse_dlive_show_file(file_content):
         # Use the very next section (wanted or not) as the boundary
         next_pos = all_found[idx + 1][0] if idx + 1 < len(all_found) else data_start + 9 * 256
         count = min((next_pos - data_start) // 9, 256)
+        default_label = DEFAULT_LABEL.get(section_name, '')
+        section_idx = 0
 
         for i in range(count):
             rec = dat[data_start + i * 9: data_start + i * 9 + 9]
@@ -364,6 +380,11 @@ def parse_dlive_show_file(file_content):
                 break  # non-ASCII = past end of section
             if not name or not name.isprintable():
                 break  # padding or control bytes = past end of section
+
+            section_idx += 1
+            # Replace bare numeric default names with a descriptive label
+            if name.isdigit():
+                name = f'{default_label} {section_idx}'
 
             counters[category] += 1
             n = counters[category]
