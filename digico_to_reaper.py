@@ -1188,6 +1188,7 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
                 <div class="select-buttons">
                     <button onclick="selectAll()">Select All</button>
                     <button onclick="selectNone()">Deselect All</button>
+                    <button onclick="removeUnnamed()" title="Deselect channels that still have their default name">Remove Unnamed</button>
                     <button id="undoBtn" onclick="undo()" disabled style="opacity: 0.4;">↩ Undo</button>
                     <button onclick="openAddChannelModal()" style="background: #007aff; color: white;">+ Add Channel</button>
                 </div>
@@ -1726,6 +1727,7 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
                 checkbox.className = 'track-checkbox';
+                checkbox.dataset.idx = idx;
                 checkbox.checked = selectedChannels.has(idx);
                 checkbox.onchange = () => toggleChannel(idx);
                 
@@ -1987,7 +1989,27 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
 
             updateSelectedCount();
         }
-        
+
+        function removeUnnamed() {
+            // Deselect channels that still have a default/auto-generated name.
+            // Matches: bare numbers ("1", "64"), and our dLive descriptive defaults
+            // ("Input 4", "Mono Aux 3", "Stereo Grp 1", "DCA 12", etc.)
+            const defaultPattern = /^(Input|Mono Grp|Stereo Grp|Mono Aux|Stereo Aux|Main|Mono Mtx|Stereo Mtx|Monitor|DCA) \d+$|^\d+$/;
+
+            currentCombinedChannels.forEach((ch, idx) => {
+                if (defaultPattern.test(ch.name.trim())) {
+                    selectedChannels.delete(idx);
+                }
+            });
+
+            document.querySelectorAll('.track-checkbox').forEach(cb => {
+                const idx = parseInt(cb.dataset.idx);
+                if (!selectedChannels.has(idx)) cb.checked = false;
+            });
+
+            updateSelectedCount();
+        }
+
         function downloadTemplate() {
             if (selectedChannels.size === 0) {
                 showMessage('Please select at least one track', 'error');
