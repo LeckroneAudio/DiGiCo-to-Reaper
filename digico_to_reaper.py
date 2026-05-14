@@ -338,6 +338,12 @@ def parse_dlive_show_file(file_content):
             all_found.append((pos, data_start, section_name))
     all_found.sort()
 
+    STEREO_SECTIONS = {
+        b'Stereo Group Channel Name Colour Manager',
+        b'Stereo Aux Channel Name Colour Manager',
+        b'Stereo Matrix Channel Name Colour Manager',
+    }
+
     # Label used when a channel has only a numeric default name (e.g. "1", "32")
     DEFAULT_LABEL = {
         b'#Input Channel Name Colour Manager':        'Input',
@@ -388,7 +394,13 @@ def parse_dlive_show_file(file_content):
 
             counters[category] += 1
             n = counters[category]
-            number = str(n) if category == 'inputs' else f'{prefix_map[category]}{n}'
+            is_stereo = section_name in STEREO_SECTIONS
+            if category == 'inputs':
+                number = str(n)
+            elif is_stereo:
+                number = f'{prefix_map[category]}{n}s'
+            else:
+                number = f'{prefix_map[category]}{n}'
             result[category].append({'number': number, 'name': name, 'type': category})
 
     print(f"\n=== DLIVE PARSE SUMMARY ===")
