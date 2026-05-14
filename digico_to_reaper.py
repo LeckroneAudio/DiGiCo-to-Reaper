@@ -1153,12 +1153,12 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
         <div class="tab-bar" id="tabBar"></div>
 
         <h1>Console to Reaper Converter</h1>
-        <p class="subtitle">Convert DiGiCo or Yamaha Rivage show files to Reaper track templates</p>
+        <p class="subtitle">Convert DiGiCo, Yamaha Rivage, or Allen &amp; Heath dLive show files to Reaper track templates</p>
 
         <div id="uploadArea" class="upload-area" onclick="document.getElementById('fileInput').click()">
             <div class="upload-icon">📄</div>
             <div class="upload-text">Drop your show file here</div>
-            <div class="upload-subtext">or click to browse &nbsp;·&nbsp; DiGiCo (.rtf) &nbsp;·&nbsp; Yamaha Rivage (.RIVAGEPM)</div>
+            <div class="upload-subtext">or click to browse &nbsp;·&nbsp; DiGiCo (.rtf) &nbsp;·&nbsp; Yamaha Rivage (.RIVAGEPM) &nbsp;·&nbsp; A&amp;H dLive (.tar.gz)</div>
         </div>
 
         <input type="file" id="fileInput" accept=".rtf,.RIVAGEPM,.rivagepm,.tar.gz" onchange="handleFile(this.files[0])">
@@ -1590,7 +1590,7 @@ class DiGiCoToReaperHandler(BaseHTTPRequestHandler):
             if (file && (name.endsWith('.rtf') || name.endsWith('.rivagepm') || name.endsWith('.tar.gz'))) {
                 handleFile(file);
             } else {
-                showMessage('Please upload a .rtf (DiGiCo) or .RIVAGEPM (Yamaha Rivage) file', 'error');
+                showMessage('Please upload a .rtf (DiGiCo), .RIVAGEPM (Yamaha Rivage), or .tar.gz (A&H dLive) file', 'error');
             }
         });
         
